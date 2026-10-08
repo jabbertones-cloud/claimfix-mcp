@@ -4,7 +4,12 @@
  * Pipeline order (deliberate):
  *   1. Tier-1 deterministic rules (src/rules.ts) — pure, no network. P1 hits
  *      short-circuit: legal threats, chargeback threats, and DND requests
- *      never wait on entitlement lookups.
+ *      never wait on entitlement lookups. Rules carry a required priority
+ *      (gap 14); the first hit in priority order wins and the winner
+ *      rationale is recorded in verifiedProof.notes.
+ *   1b. Contradiction surfacing (src/contradictions.ts, gap 29) — competing
+ *      assertions are surfaced verbatim into verifiedProof.notes. Notes-only:
+ *      never changes triageLevel / category / resolutionAction.
  *   2. Entitlement verification against the ledger (if one is provided) —
  *      matches claim email to recorded Stripe events.
  *   3. Everything else falls through to P3 general complaint.
@@ -14,6 +19,7 @@
  */
 
 import { evaluateTier1, type TriageLevel } from "./rules.js";
+import { detectContradictions } from "./contradictions.js";
 import type { EntitlementLedger } from "./entitlement.js";
 
 export type { TriageLevel };
@@ -57,9 +63,15 @@ export function diagnose(
     throw new Error("diagnose: claimId and customerEmail are required");
   }
 
-  // 1. Tier-1 deterministic rules first.
-  const { hits, matched } = evaluateTier1(payload);
+  // 1. Tier-1 deterministic rules first (priority-ordered).
+  const { hits, matched, winnerNote } = evaluateTier1(payload);
   const ruleHits = hits.map((h) => h.ruleId);
+
+  // 1b. Contradiction surfacing: notes-only, never re-triages.
+  const contra = detectContradictions(payload, { category: matched?.category });
+  for (const id of contra.ruleHits) {
+    if (!ruleHits.includes(id)) ruleHits.push(id);
+  }
 
   // 2. Entitlement verification (ledger only; no network in v0).
   let proof: VerifiedProof;
@@ -81,6 +93,13 @@ export function diagnose(
   } else {
     proof = emptyProof("no entitlement ledger provided; verification skipped");
   }
+
+  // Audit trail: winner rationale + per-hit match details + contradiction notes.
+  if (winnerNote) proof.notes.push(winnerNote);
+  for (const h of hits) {
+    if (h.detail) proof.notes.push(`${h.ruleId}: ${h.detail}`);
+  }
+  proof.notes.push(...contra.notes);
 
   // 3. Tier-1 P1 hits short-circuit; otherwise use the matched rule or P3 default.
   if (matched && matched.level === "P1") {
