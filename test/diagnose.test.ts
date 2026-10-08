@@ -113,6 +113,51 @@ describe("diagnose contract", () => {
     assert.equal(a.matched?.level, "P1");
   });
 
+  it("P2: fuzzy billing phrase — 'charged me twice' (gap 13)", () => {
+    const d = diagnose({
+      claimId: "c-013a",
+      customerEmail: "fuzzy@example.com",
+      subject: "Billing question",
+      body: "They charged me twice for this order and I want it fixed.",
+    });
+    assert.equal(d.triageLevel, "P2");
+    assert.equal(d.category, "billing_dispute");
+    assert.ok(d.ruleHits.includes("billing_dispute"));
+    assert.ok(
+      d.verifiedProof.notes.some((n) => n.includes("fuzzy phrase match")),
+      "audit note records pattern/score/threshold",
+    );
+  });
+
+  it("P3: negation guard — 'not charged twice' does not bill (gap 13)", () => {
+    const d = diagnose({
+      claimId: "c-013b",
+      customerEmail: "neg@example.com",
+      subject: "Statement question",
+      body: "I was not charged twice, the statement is correct, I just have a question about the amount.",
+    });
+    assert.equal(d.triageLevel, "P3");
+    assert.equal(d.category, "general_complaint");
+    assert.deepEqual(d.ruleHits, []);
+  });
+
+  it("contradiction surfacing: both verbatim statements survive, triage unchanged", () => {
+    const d = diagnose({
+      claimId: "c-015",
+      customerEmail: "fixture.15@example.com",
+      subject: "Double charge confusion",
+      body: "You charged twice for my order, but I never received it. Actually, wait — I did receive a box yesterday and it was completely empty inside.",
+    });
+    assert.equal(d.triageLevel, "P2");
+    assert.equal(d.category, "billing_dispute");
+    assert.equal(d.resolutionAction, "verify_entitlement_then_refund_or_explain");
+    assert.ok(d.ruleHits.includes("contradiction_receipt_never_vs_received"));
+    const raw = JSON.stringify(d);
+    assert.ok(raw.includes("never received"), "first assertion survives verbatim");
+    assert.ok(raw.includes("receive a box"), "second assertion survives verbatim");
+    assert.ok(raw.includes("empty"), "second assertion survives verbatim");
+  });
+
   it("requires claimId and customerEmail", () => {
     assert.throws(
       () => diagnose({ claimId: "", customerEmail: "", subject: "s", body: "b" }),

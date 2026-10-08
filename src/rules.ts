@@ -11,12 +11,15 @@
  */
 
 import type { ClaimPayload } from "./diagnose.js";
+import { BILLING_PHRASES, matchPhrases, negatedBeforePhrase, tokenize } from "./fuzzy.js";
 
 export type TriageLevel = "P1" | "P2" | "P3";
 
 export interface RuleHit {
   ruleId: string;
   expr: string;
+  /** Audit detail recorded when the rule matches (pattern, score, ...). */
+  detail?: string;
 }
 
 export interface Tier1Rule {
@@ -24,6 +27,8 @@ export interface Tier1Rule {
   /** Boolean expression over the payload, in zeroSteiner-style notation (for audit). */
   expr: string;
   when: (payload: ClaimPayload) => boolean;
+  /** Optional audit detail recorded when the rule matches. */
+  matchDetail?: (payload: ClaimPayload) => string | undefined;
   level: TriageLevel;
   category: string;
   resolutionAction: string;
@@ -37,6 +42,39 @@ const DND_RE = /unsubscrib|do\s*not\s*(contact|email|call|text)\s*me|remove\s*me
 const LEGAL_RE = /lawsuit|sue\s+you|my\s+(attorney|lawyer)|legal\s+action|small\s+claims|better\s+business\s+bureau|\bftc\b|consumer\s+protection/i;
 const CHARGEBACK_RE = /chargeback|disput(e|ing)\s+(the\s+)?charge|reverse\s+(the\s+)?payment|call(ing)?\s+my\s+bank|report\s+(as\s+)?fraud/i;
 const BILLING_RE = /charged\s+twice|double\s+charge|wrong\s+amount|didn'?t\s+authori[sz]e|unauthorized\s+charge|refund/i;
+
+/**
+ * Gap 13: keep the regex as an exact fast path; fall back to the fuzzy
+ * phrase scorer (RapidFuzz token_set_ratio port) so "charged me twice",
+ * "they charged my card twice", "charged 2 times" etc. all match.
+ *
+ * The negation guard applies to BOTH paths: the exact regex contains
+ * "charged twice" as a literal substring, so "I was NOT charged twice" would
+ * otherwise bill through the fast path. A negated exact match is skipped.
+ *
+ * Returns an audit string for verifiedProof.notes, or undefined on no match.
+ */
+const BILLING_EXACT: Array<{ re: RegExp; phrase: string }> = [
+  { re: /charged\s+twice/i, phrase: "charged twice" },
+  { re: /double\s+charge/i, phrase: "double charge" },
+  { re: /wrong\s+amount/i, phrase: "wrong amount" },
+  { re: /didn'?t\s+authori[sz]e/i, phrase: "did not authorize" },
+  { re: /unauthorized\s+charge/i, phrase: "unauthorized charge" },
+  { re: /refund/i, phrase: "refund" }, // single token: exempt from negation guard
+];
+
+function billingMatchDetail(p: ClaimPayload): string | undefined {
+  const text = textOf(p);
+  for (const { re, phrase } of BILLING_EXACT) {
+    if (!re.test(text)) continue;
+    if (tokenize(phrase).length > 1 && negatedBeforePhrase(text, phrase)) continue;
+    return `exact pattern match "${phrase}"`;
+  }
+  const hits = matchPhrases(text, BILLING_PHRASES);
+  if (hits.length === 0) return undefined;
+  const best = hits[0];
+  return `fuzzy phrase match "${best.pattern}" score ${best.score} >= threshold ${best.threshold}`;
+}
 
 export const TIER1_RULES: Tier1Rule[] = [
   {
@@ -75,8 +113,9 @@ export const TIER1_RULES: Tier1Rule[] = [
   },
   {
     id: "billing_dispute",
-    expr: "subject_or_body matches BILLING_PATTERN",
-    when: (p) => BILLING_RE.test(textOf(p)),
+    expr: "subject_or_body matches BILLING_PATTERN (regex fast path + fuzzy phrase scorer)",
+    when: (p) => billingMatchDetail(p) !== undefined,
+    matchDetail: billingMatchDetail,
     level: "P2",
     category: "billing_dispute",
     resolutionAction: "verify_entitlement_then_refund_or_explain",
@@ -89,7 +128,7 @@ export function evaluateTier1(payload: ClaimPayload): { hits: RuleHit[]; matched
   let matched: Tier1Rule | undefined;
   for (const rule of TIER1_RULES) {
     if (rule.when(payload)) {
-      hits.push({ ruleId: rule.id, expr: rule.expr });
+      hits.push({ ruleId: rule.id, expr: rule.expr, detail: rule.matchDetail?.(payload) });
       if (!matched) matched = rule;
     }
   }

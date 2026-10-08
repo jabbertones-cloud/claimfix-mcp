@@ -5,6 +5,9 @@
  *   1. Tier-1 deterministic rules (src/rules.ts) — pure, no network. P1 hits
  *      short-circuit: legal threats, chargeback threats, and DND requests
  *      never wait on entitlement lookups.
+ *   1b. Contradiction surfacing (src/contradictions.ts) — competing
+ *      assertions are surfaced verbatim into verifiedProof.notes. Notes-only:
+ *      never changes triageLevel / category / resolutionAction.
  *   2. Entitlement verification against the ledger (if one is provided) —
  *      matches claim email to recorded Stripe events.
  *   3. Everything else falls through to P3 general complaint.
@@ -14,6 +17,7 @@
  */
 
 import { evaluateTier1, type TriageLevel } from "./rules.js";
+import { detectContradictions } from "./contradictions.js";
 import type { EntitlementLedger } from "./entitlement.js";
 
 export type { TriageLevel };
@@ -61,6 +65,12 @@ export function diagnose(
   const { hits, matched } = evaluateTier1(payload);
   const ruleHits = hits.map((h) => h.ruleId);
 
+  // 1b. Contradiction surfacing: notes-only, never re-triages.
+  const contra = detectContradictions(payload, { category: matched?.category });
+  for (const id of contra.ruleHits) {
+    if (!ruleHits.includes(id)) ruleHits.push(id);
+  }
+
   // 2. Entitlement verification (ledger only; no network in v0).
   let proof: VerifiedProof;
   if (opts.ledger) {
@@ -81,6 +91,12 @@ export function diagnose(
   } else {
     proof = emptyProof("no entitlement ledger provided; verification skipped");
   }
+
+  // Audit trail: per-hit match details + contradiction notes.
+  for (const h of hits) {
+    if (h.detail) proof.notes.push(`${h.ruleId}: ${h.detail}`);
+  }
+  proof.notes.push(...contra.notes);
 
   // 3. Tier-1 P1 hits short-circuit; otherwise use the matched rule or P3 default.
   if (matched && matched.level === "P1") {
