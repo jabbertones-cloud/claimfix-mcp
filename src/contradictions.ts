@@ -177,7 +177,22 @@ export function detectAmountMismatch(text: string): AmountMismatch | null {
   return { stated, charged };
 }
 
-const RETRACTION_RE = /actually,?\s*wait|sorry,?\s*i\s+meant|i\s+was\s+wrong|scratch\s+that|\bcorrection:/i;
+const RETRACTION_RE =
+  /actually,?\s*wait|sorry,?\s*i\s+meant|i\s+was\s+wrong|scratch\s+that|\bcorrection:|\bno,?\s*wait\b|\bwait,?\s*no\b|\bhold\s+on\b/i;
+
+/**
+ * TL-042: text after the first retraction marker. A retraction retracts
+ * what precedes it ("charged twice — no wait, it was a pending hold":
+ * the "charged twice" claim is withdrawn). Billing matching runs on the
+ * post-retraction text so a withdrawn money claim cannot outrank the
+ * route the customer actually asked for. A marker at the very start
+ * ("no wait, I was charged twice") retracts nothing — the claim stands.
+ */
+export function postRetractionText(text: string): string {
+  const m = RETRACTION_RE.exec(text);
+  if (!m || m.index === undefined) return text;
+  return text.slice(m.index + m[0].length);
+}
 
 const TEMPORAL_RE =
   /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|yesterday|today|tomorrow|last\s+night|last\s+week|this\s+morning|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\/-]\d{1,2})\b/i;
@@ -292,6 +307,18 @@ export function detectContradictions(
           : "") +
         ` [severity: ${finding.severity}; both statements preserved verbatim for entitlement/human review]`,
     );
+  }
+
+  // TL-042: a retraction marker with no competing-assertion pair still
+  // leaves a trace. The marker is recorded, never resolved — and triage
+  // already ran on the post-retraction text (see billingMatchDetail), so
+  // the note explains why a withdrawn claim did not win.
+  if (retraction && findings.length === 0) {
+    notes.push(
+      `retraction noted: "${retraction[0]}" — recorded, not resolved; ` +
+        `assertions before the marker were treated as withdrawn for triage`,
+    );
+    ruleHits.push("retraction_noted");
   }
 
   return { notes, ruleHits, findings };

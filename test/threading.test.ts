@@ -116,6 +116,32 @@ describe("(b) 'what did we decide' recall", () => {
       },
       session,
     );
+    // TL-040: "duplicate charge" is now a real tier-1 billing signal, so
+    // this classifies fresh as billing (tier-1 always beats threading per
+    // the 3b contract) — same level/category/action the recall would have
+    // inherited, but as a fresh decision that resets the anchor. A pure
+    // recall question with no tier-1 signal still recalls (next test).
+    assert.equal(recall.triageLevel, "P2");
+    assert.equal(recall.category, "billing_dispute");
+    assert.equal(recall.resolutionAction, "verify_entitlement_then_refund_or_explain");
+    assert.ok(!recall.ruleHits.includes("context_recall"));
+    assert.ok(!recall.ruleHits.includes("context_threading"));
+  });
+
+  it("TL-040: pure recall question with no tier-1 signal still recalls", () => {
+    const session = new InMemoryClaimSessionTracker();
+    dx(
+      {
+        claimId: "claim-001",
+        subject: "double charge",
+        body: "I was charged twice for my subscription last month, what do I do?",
+      },
+      session,
+    );
+    const recall = dx(
+      { claimId: "claim-002", body: "What did we decide about it?" },
+      session,
+    );
     assert.equal(recall.triageLevel, "P2");
     assert.equal(recall.category, "billing_dispute");
     assert.equal(recall.resolutionAction, "verify_entitlement_then_refund_or_explain");
@@ -124,7 +150,7 @@ describe("(b) 'what did we decide' recall", () => {
       recall.verifiedProof.notes.some(
         (n) => n.includes("claim-001") && n.includes("verify_entitlement_then_refund_or_explain"),
       ),
-      "recall note names the ORIGINAL anchor claim-001, not the follow-up claim-002",
+      "recall note names the ORIGINAL anchor claim-001",
     );
   });
 

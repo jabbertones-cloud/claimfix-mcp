@@ -70,11 +70,21 @@ export interface ClaimSessionTracker {
   recordDecision(customerEmail: string, decision: ConversationDecision): void;
 }
 
+/**
+ * TL-043: normalization is comparison-only. Trailing whitespace (or
+ * doubled internal spaces) must not defeat dedup — "resubmit" with one
+ * extra space is the same claim. The payload itself stays verbatim;
+ * only the fingerprint is normalized.
+ */
+function normalizeForFingerprint(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
 function contentFingerprint(payload: ClaimPayload): string {
   return JSON.stringify({
     customerEmail: payload.customerEmail.trim().toLowerCase(),
-    subject: payload.subject ?? "",
-    body: payload.body ?? "",
+    subject: normalizeForFingerprint(payload.subject ?? ""),
+    body: normalizeForFingerprint(payload.body ?? ""),
   });
 }
 

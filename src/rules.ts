@@ -15,7 +15,7 @@
  */
 
 import type { ClaimPayload } from "./diagnose.js";
-import { detectAmountMismatch, formatMoney } from "./contradictions.js";
+import { detectAmountMismatch, formatMoney, postRetractionText } from "./contradictions.js";
 import {
   BILLING_PHRASES,
   NEGATION_TOKENS,
@@ -181,6 +181,11 @@ interface LocalizedPatternSet {
   legal: GuardedPattern[];
   chargeback: GuardedPattern[];
   dnd: GuardedPattern[];
+  // TL-041: billing slot. TL-015 shipped legal/chargeback/dnd only, so
+  // Spanish money complaints fell to P3 while Spanish P1s escalated —
+  // partial localization worse than none. Same guarded-pattern +
+  // negation discipline as the other slots.
+  billing: GuardedPattern[];
 }
 
 const LOCALIZED_PATTERN_SETS: LocalizedPatternSet[] = [
@@ -209,6 +214,15 @@ const LOCALIZED_PATTERN_SETS: LocalizedPatternSet[] = [
       { re: /\bcancel\w*\s+mi\s+suscripci[oó]n\b/i, phrase: "cancelar mi suscripción", guard: "cancelar cancelen mi suscripcion", lang: "es" },
       { re: /\bdarme\s+de\s+baja\b/i, phrase: "darme de baja", lang: "es" },
       { re: /\bdejar\s+de\s+recibir\s+correos\b/i, phrase: "dejar de recibir correos", guard: "dejar de recibir correos", lang: "es" },
+    ],
+    billing: [
+      { re: /\bme\s+cobraron\s+dos\s+veces\b/i, phrase: "me cobraron dos veces", guard: "me cobraron cobrar dos veces", lang: "es" },
+      { re: /\bcargo\s+duplicado\b/i, phrase: "cargo duplicado", guard: "cargo duplicado", lang: "es" },
+      { re: /\bcobro\s+duplicado\b/i, phrase: "cobro duplicado", guard: "cobro duplicado", lang: "es" },
+      { re: /\bme\s+cobraron\s+de\s+m[aá]s\b/i, phrase: "me cobraron de más", guard: "me cobraron cobrar de mas", lang: "es" },
+      { re: /\bdos\s+cargos\b/i, phrase: "dos cargos", guard: "dos cargos", lang: "es" },
+      { re: /\bquiero\s+un\s+reembolso\b/i, phrase: "quiero un reembolso", guard: "quiero reembolso", lang: "es" },
+      { re: /\breembolso\b/i, phrase: "reembolso", lang: "es" },
     ],
   },
 ];
@@ -244,6 +258,10 @@ const dndMatchDetail = (p: ClaimPayload): string | undefined =>
 const BILLING_EXACT: Array<{ re: RegExp; phrase: string }> = [
   { re: /charged\s+twice/i, phrase: "charged twice" },
   { re: /double\s+charge/i, phrase: "double charge" },
+  // TL-040: exact fast-path twin of the fuzzy "duplicate charge" entry.
+  // Multi-token, so the shared negatedBeforePhrase guard applies
+  // ("not a duplicate charge" stays silent) exactly like "double charge".
+  { re: /duplicat(?:e|ed)\s+charges?/i, phrase: "duplicate charge" },
   { re: /wrong\s+amount/i, phrase: "wrong amount" },
   { re: /amount\s+(mismatch|difference|discrepancy)/i, phrase: "amount mismatch" },
   { re: /didn'?t\s+authori[sz]e/i, phrase: "did not authorize" },
@@ -285,12 +303,19 @@ function refundRefused(text: string): boolean {
 
 function billingMatchDetail(p: ClaimPayload): string | undefined {
   const text = textOf(p);
-  const refused = refundRefused(text);
+  // TL-042: billing signals are matched on the post-retraction text. A
+  // withdrawn money claim ("charged twice — no wait, it was a pending
+  // hold") must not outrank the route the customer actually asked for;
+  // the retraction itself is traced in notes by detectContradictions.
+  // The refund-refusal check uses the same text: a retracted refusal
+  // ("I don't want a refund — no wait, yes I do") is not a refusal.
+  const billingText = postRetractionText(text);
+  const refused = refundRefused(billingText);
   // TL-014: a stated-vs-charged amount mismatch is itself a billing
   // signal — the customer is disputing money, even when no stock billing
   // phrase ("charged twice", "refund") appears. It surfaces here as the
   // billing hit and again, verbatim, via the amount contradiction facet.
-  const mismatch = detectAmountMismatch(text);
+  const mismatch = detectAmountMismatch(billingText);
   if (mismatch) {
     return (
       `amount mismatch: stated ${formatMoney(mismatch.stated.cents)} ` +
@@ -298,14 +323,23 @@ function billingMatchDetail(p: ClaimPayload): string | undefined {
     );
   }
   for (const { re, phrase } of BILLING_EXACT) {
-    if (!re.test(text)) continue;
+    if (!re.test(billingText)) continue;
     if (phrase === "refund") {
       if (refused) continue;
-    } else if (tokenize(phrase).length > 1 && negatedBeforePhrase(text, phrase)) {
+    } else if (tokenize(phrase).length > 1 && negatedBeforePhrase(billingText, phrase)) {
       continue;
     }
     return `exact pattern match "${phrase}"`;
   }
+  // TL-041: localized billing through the same guarded-pattern mechanism
+  // as TL-015's P1 sets (negation guard included — "no me cobraron dos
+  // veces" stays silent). Matched on post-retraction text like the rest
+  // of the billing signals (TL-042).
+  const localizedBilling = guardedPatternDetail(
+    billingText,
+    LOCALIZED_PATTERN_SETS.flatMap((s) => s.billing),
+  );
+  if (localizedBilling) return localizedBilling;
   // Wave-1 F1 (GAP-claimfix-30): fuzzy phrase matching is FIELD-LOCAL.
   // token_set_ratio assembles a phrase from the union of subject+body
   // tokens, so subject "Second charge?" donated "charge" and the body's
@@ -314,7 +348,9 @@ function billingMatchDetail(p: ClaimPayload): string | undefined {
   // the pending-hold route the customer actually asked for. A billing
   // phrase's tokens must co-occur inside one field; the exact-regex
   // fast path above stays on combined text (it needs adjacency anyway).
+  // TL-042: each field is retraction-scoped first, same as the exact path.
   const hits = [p.subject ?? "", p.body ?? ""]
+    .map((field) => postRetractionText(field))
     .flatMap((field) => matchPhrases(field, BILLING_PHRASES))
     .filter((h) => h.pattern !== "refund" || !refused)
     .sort((a, b) => b.score - a.score);

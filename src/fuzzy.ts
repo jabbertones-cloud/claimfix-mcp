@@ -376,6 +376,11 @@ export function matchPhrases(text: string, patterns: PhrasePattern[]): PhraseHit
 export const BILLING_PHRASES: PhrasePattern[] = [
   { phrase: "charged twice", threshold: 85 },
   { phrase: "double charge", threshold: 85 },
+  // TL-040: "duplicate charge(d)" is the same billing shape as
+  // "double charge" — without it a billing follow-up fragment
+  // ("that duplicate charge") fires no tier-1 rule and threading
+  // inherits the session's prior P1/legal escalation instead.
+  { phrase: "duplicate charge", threshold: 85 },
   { phrase: "wrong amount", threshold: 85 },
   { phrase: "did not authorize", threshold: 85 },
   { phrase: "unauthorized charge", threshold: 85 },
