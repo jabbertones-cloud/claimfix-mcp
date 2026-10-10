@@ -1,79 +1,90 @@
 /**
- * Fuzzy phrase scoring for tier-1 billing patterns (gap 13).
+ * Gap 13 — fuzzy billing-phrase matching.
  *
- * Ports RapidFuzz's `token_set_ratio` semantics to TypeScript (zero deps):
- * tokenize -> lowercase -> canonicalize -> dedupe -> set ops. If one token
- * set is a subset of the other, the score is 100 regardless of intervening
- * words or order ("charged me twice" vs pattern "charged twice"). Explicit
- * token disagreement lowers the score. Returns a numeric score so the audit
- * trail can record `pattern, score, threshold` (gap doc WANT list).
+ * Ports RapidFuzz's token_set_ratio (MIT) to dependency-free TypeScript:
+ *   normalize -> tokenize -> lowercase -> dedupe -> sort -> set ops
+ * A phrase scores 100 when its token set is a SUBSET of the text's token set,
+ * regardless of extra or intervening words. That is exactly the concrete bug:
+ * BILLING_RE required the literal sequence "charged" + whitespace + "twice",
+ * so the most natural phrasing — "charged me twice" — silently missed and the
+ * claim fell through to P3.
  *
- * Stays deterministic: pure function, no network, no model.
+ * Borrowing decisions (see testlabs-fleet/gap-fixes/claimfix-billing-phrase-match.md):
+ * - BORROW: RapidFuzz token_set_ratio algorithm; compromise normalization-first
+ *   staging; flashtext-style alias canonicalization; spaczz per-pattern
+ *   thresholds (min_r) and overlap resolution (highest score wins primary,
+ *   all hits kept).
+ * - VERIFY (not built): nlp.js best-substring search on typo-heavy samples;
+ *   threshold values against the torture pack.
+ * - SKIP: Fuse bitap (wrong problem — no token slop); any Python/ML dependency;
+ *   WRatio and the weighted-scorer zoo.
  */
 
-const NUMBER_CANON: Record<string, string> = {
+const NUMBER_ALIASES: Record<string, string> = {
   twice: "2x",
+  double: "2x",
   x2: "2x",
   two: "2",
+  one: "1",
+  once: "1x",
 };
 
-const NEGATION_TOKENS = new Set(["not", "no", "never", "nt", "didnt", "dont", "doesnt", "wasnt", "isnt"]);
+const CONTRACTION_RULES: Array<[RegExp, string]> = [
+  [/\bwon't\b/g, "will not"],
+  [/\bcan't\b/g, "can not"],
+  [/n't\b/g, " not"], // didn't -> did not, wasn't -> was not, ...
+];
 
-/** Normalize raw text before tokenizing: case, contractions, number forms. */
-export function normalizeText(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/(\d+)\s+times\b/g, "$1x")
-    .replace(/['’]/g, "");
-}
+/** "2 times" / "two times" -> "2x" so they align with "twice". */
+const NUMBER_TIMES_RE = /\b(\d+)\s+times?\b/g;
 
-export function tokenize(text: string): string[] {
-  return normalizeText(text)
+function normalize(s: string): string {
+  let out = s.toLowerCase();
+  for (const [re, rep] of CONTRACTION_RULES) out = out.replace(re, rep);
+  const words = out
     .split(/[^a-z0-9]+/)
     .filter(Boolean)
-    .map((t) => NUMBER_CANON[t] ?? t);
+    .map((w) => NUMBER_ALIASES[w] ?? w);
+  return words.join(" ").replace(NUMBER_TIMES_RE, "$1x");
 }
 
-function levenshtein(a: string, b: string): number {
-  if (a === b) return 0;
-  if (a.length === 0) return b.length;
-  if (b.length === 0) return a.length;
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    const cur = [i];
-    for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    prev = cur;
-  }
-  return prev[b.length];
+/** Lowercased, punctuation-stripped, number-canonicalized tokens. */
+export function tokenize(s: string): string[] {
+  return normalize(s).split(/\s+/).filter(Boolean);
 }
 
-/** RapidFuzz fuzz.ratio: (la + lb - lev) / (la + lb) scaled to 0..100. */
-function ratio(a: string, b: string): number {
-  if (a.length === 0 && b.length === 0) return 100;
-  if (a.length === 0 || b.length === 0) return 0;
-  return ((a.length + b.length - levenshtein(a, b)) / (a.length + b.length)) * 100;
+function uniqueSorted(tokens: string[]): string[] {
+  return [...new Set(tokens)].sort();
 }
 
 /**
- * RapidFuzz token_set_ratio: compares the sorted intersection against each
- * side's intersection+remainder combination and takes the max ratio.
+ * RapidFuzz token_set_ratio port. Returns 0-100.
+ * 100 when one token set is a subset of the other (extra words tolerated,
+ * word order ignored); explicit disagreement lowers the score.
  */
 export function tokenSetRatio(a: string, b: string): number {
-  const setA = new Set(tokenize(a));
-  const setB = new Set(tokenize(b));
-  const inter = [...setA].filter((t) => setB.has(t)).sort();
-  const remA = [...setA].filter((t) => !setB.has(t)).sort();
-  const remB = [...setB].filter((t) => !setA.has(t)).sort();
-  const t0 = inter.join(" ");
-  const c1 = [...inter, ...remA].join(" ").trim();
-  const c2 = [...inter, ...remB].join(" ").trim();
-  return Math.max(ratio(t0, c1), ratio(t0, c2), ratio(c1, c2));
+  const t1 = uniqueSorted(tokenize(a));
+  const t2 = uniqueSorted(tokenize(b));
+  if (t1.length === 0 || t2.length === 0) return 0;
+  const set2 = new Set(t2);
+  const inter = t1.filter((t) => set2.has(t));
+  if (inter.length === 0) return 0;
+  const setInter = new Set(inter);
+  const rem1 = t1.filter((t) => !setInter.has(t));
+  const rem2 = t2.filter((t) => !setInter.has(t));
+  const diff1 = [...inter, ...rem1];
+  const diff2 = [...inter, ...rem2];
+  const base = (x: string[], y: string[]): number => {
+    const ys = new Set(y);
+    const common = x.filter((t) => ys.has(t)).length;
+    return (2 * common) / (x.length + y.length);
+  };
+  return 100 * Math.max(base(inter, diff1), base(inter, diff2), base(diff1, diff2));
 }
 
 export interface PhrasePattern {
   phrase: string;
+  /** Minimum token_set_ratio (0-100) for a hit. Per-pattern (spaczz min_r). */
   threshold: number;
 }
 
@@ -83,44 +94,91 @@ export interface PhraseHit {
   threshold: number;
 }
 
-/** Billing phrases scored by the fuzzy path (regex remains the fast path). */
+const NEGATION_TOKENS = new Set([
+  "not",
+  "never",
+  "no",
+  "none",
+  "without",
+  "neither",
+  "nor",
+  "cannot",
+  "cant",
+  "dont",
+  "wont",
+  "didnt",
+  "doesnt",
+  "isnt",
+  "arent",
+  "wasnt",
+  "werent",
+  "hasnt",
+  "havent",
+  "couldnt",
+  "shouldnt",
+]);
+
+const NEGATION_WINDOW = 3;
+
+/**
+ * True when a negation token appears within NEGATION_WINDOW tokens BEFORE the
+ * earliest occurrence of any phrase token in the text ("I was not charged
+ * twice"). Exported so the exact-regex fast path in rules.ts applies the same
+ * guard — a negated exact match ("not charged twice") must not bill either.
+ */
+export function negatedBeforePhrase(text: string, phrase: string): boolean {
+  const tokens = tokenize(text);
+  return negatedBefore(tokens, new Set(tokenize(phrase)));
+}
+
+/** True when a negation token appears within NEGATION_WINDOW tokens BEFORE
+ * the earliest matched phrase token ("I was not charged twice"). */
+function negatedBefore(textTokens: string[], phraseTokenSet: Set<string>): boolean {
+  let earliest = -1;
+  for (let i = 0; i < textTokens.length; i++) {
+    if (phraseTokenSet.has(textTokens[i])) {
+      earliest = i;
+      break;
+    }
+  }
+  if (earliest === -1) return false;
+  for (let i = Math.max(0, earliest - NEGATION_WINDOW); i < earliest; i++) {
+    if (NEGATION_TOKENS.has(textTokens[i])) return true;
+  }
+  return false;
+}
+
+/**
+ * Score each pattern against the text; keep hits at/above threshold.
+ * Overlap resolution (spaczz SpaczzRuler): highest score first, all hits kept.
+ *
+ * Negation guard applies to MULTI-token phrases only: "I was not charged
+ * twice" must not bill. Single-token patterns (e.g. "refund") are exempt —
+ * "I did not get a refund" is still a billing complaint, and negation-scope
+ * resolution is its own sub-problem (see gap report, unknown-unknown #1).
+ */
+export function matchPhrases(text: string, patterns: PhrasePattern[]): PhraseHit[] {
+  const tokens = tokenize(text);
+  const hits: PhraseHit[] = [];
+  for (const { phrase, threshold } of patterns) {
+    const score = tokenSetRatio(phrase, text);
+    if (score < threshold) continue;
+    const phraseTokens = tokenize(phrase);
+    if (phraseTokens.length > 1 && negatedBefore(tokens, new Set(phraseTokens))) {
+      continue;
+    }
+    hits.push({ pattern: phrase, score: Math.round(score), threshold });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  return hits;
+}
+
+/** Billing phrase patterns (thresholds per pattern; VERIFY against torture pack). */
 export const BILLING_PHRASES: PhrasePattern[] = [
   { phrase: "charged twice", threshold: 85 },
   { phrase: "double charge", threshold: 85 },
   { phrase: "wrong amount", threshold: 85 },
   { phrase: "did not authorize", threshold: 85 },
   { phrase: "unauthorized charge", threshold: 85 },
+  { phrase: "refund", threshold: 100 },
 ];
-
-/**
- * Negation guard (gap 13 unknown-unknown #1): a negation token within
- * `window` tokens before the first matched phrase token suppresses the hit,
- * so "I was not charged twice" does not bill. Phrases that themselves carry
- * a negation token ("did not authorize") are exempt.
- */
-export function negatedBeforePhrase(text: string, phrase: string, window = 3): boolean {
-  const phraseTokens = tokenize(phrase);
-  if (phraseTokens.some((t) => NEGATION_TOKENS.has(t))) return false;
-  const tokens = tokenize(text);
-  const anchors = new Set(phraseTokens);
-  for (let i = 0; i < tokens.length; i++) {
-    if (!anchors.has(tokens[i])) continue;
-    for (let j = Math.max(0, i - window); j < i; j++) {
-      if (NEGATION_TOKENS.has(tokens[j])) return true;
-    }
-    return false;
-  }
-  return false;
-}
-
-/** Score every pattern against the text; return hits at/above threshold, best first. */
-export function matchPhrases(text: string, patterns: PhrasePattern[]): PhraseHit[] {
-  const hits: PhraseHit[] = [];
-  for (const { phrase, threshold } of patterns) {
-    const score = tokenSetRatio(text, phrase);
-    if (score < threshold) continue;
-    if (negatedBeforePhrase(text, phrase)) continue;
-    hits.push({ pattern: phrase, score: Math.round(score * 10) / 10, threshold });
-  }
-  return hits.sort((x, y) => y.score - x.score);
-}

@@ -4,8 +4,10 @@
  * Pipeline order (deliberate):
  *   1. Tier-1 deterministic rules (src/rules.ts) — pure, no network. P1 hits
  *      short-circuit: legal threats, chargeback threats, and DND requests
- *      never wait on entitlement lookups.
- *   1b. Contradiction surfacing (src/contradictions.ts) — competing
+ *      never wait on entitlement lookups. Rules carry a required priority
+ *      (gap 14); the first hit in priority order wins and the winner
+ *      rationale is recorded in verifiedProof.notes.
+ *   1b. Contradiction surfacing (src/contradictions.ts, gap 29) — competing
  *      assertions are surfaced verbatim into verifiedProof.notes. Notes-only:
  *      never changes triageLevel / category / resolutionAction.
  *   2. Entitlement verification against the ledger (if one is provided) —
@@ -61,8 +63,8 @@ export function diagnose(
     throw new Error("diagnose: claimId and customerEmail are required");
   }
 
-  // 1. Tier-1 deterministic rules first.
-  const { hits, matched } = evaluateTier1(payload);
+  // 1. Tier-1 deterministic rules first (priority-ordered).
+  const { hits, matched, winnerNote } = evaluateTier1(payload);
   const ruleHits = hits.map((h) => h.ruleId);
 
   // 1b. Contradiction surfacing: notes-only, never re-triages.
@@ -92,7 +94,8 @@ export function diagnose(
     proof = emptyProof("no entitlement ledger provided; verification skipped");
   }
 
-  // Audit trail: per-hit match details + contradiction notes.
+  // Audit trail: winner rationale + per-hit match details + contradiction notes.
+  if (winnerNote) proof.notes.push(winnerNote);
   for (const h of hits) {
     if (h.detail) proof.notes.push(`${h.ruleId}: ${h.detail}`);
   }
