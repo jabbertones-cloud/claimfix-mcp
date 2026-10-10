@@ -60,7 +60,7 @@ const CONTRADICTION_PAIRS: ContradictionPair[] = [
   {
     id: "receipt_never_vs_received",
     facet: "receipt",
-    expr: "NEVER_RECEIVED_RE and RECEIVED_EMPTY_RE in different sentences",
+    expr: "NEVER_RECEIVED_RE and RECEIVED_EMPTY_RE in the same or different sentences",
     a: /\bnever\s+(received|got|arrived)\b/i,
     // "did receive ... empty (box)": base/past/progressive forms all occur
     b: /\breceiv(?:e|ed|ing)\b[^.!?]{0,120}\bempty\b/i,
@@ -68,7 +68,7 @@ const CONTRADICTION_PAIRS: ContradictionPair[] = [
   {
     id: "charge_count_twice_vs_once",
     facet: "charge_count",
-    expr: "CHARGED_TWICE and CHARGED_ONCE assertions in different sentences (fuzzy: intervening words tolerated)",
+    expr: "CHARGED_TWICE and CHARGED_ONCE assertions in the same or different sentences (fuzzy: intervening words tolerated)",
     a: /\bcharged\s+twice\b/i,
     b: /\bcharged\s+(only\s+|just\s+)?once\b/i,
     aPhrases: [{ phrase: "charged twice", threshold: 85 }],
@@ -77,11 +77,105 @@ const CONTRADICTION_PAIRS: ContradictionPair[] = [
   {
     id: "address_wrong_vs_correct",
     facet: "delivery_address",
-    expr: "WRONG_ADDRESS_RE and ADDRESS_CORRECT_RE in different sentences",
+    expr: "WRONG_ADDRESS_RE and ADDRESS_CORRECT_RE in the same or different sentences",
     a: /\bwrong\s+address\b/i,
     b: /\baddress\s+(was\s+|is\s+)?correct\b|\bconfirmed\s+(the\s+)?address\b/i,
   },
 ];
+
+/**
+ * TL-014: amount facet. The pair table above only knows receipt /
+ * charge_count / address assertions; a stated-vs-charged money mismatch
+ * ("receipt says $49 but my card was charged $94") matched none of them
+ * and was invisible. Amounts need value comparison, not just assertion
+ * spotting — two mentions of the SAME amount are consistent, not a
+ * contradiction — so this facet extracts role-tagged amounts first:
+ * each "$" mention is classified stated (receipt/invoice/quote/total
+ * context) or charged (card/bank/charge context) by the nearest cue
+ * around it, then the first stated and first charged amounts are
+ * compared in integer cents. Exported for rules.ts, where a mismatch
+ * also counts as a billing signal.
+ */
+export interface AmountAssertion {
+  cents: number;
+  /** Verbatim sentence containing the amount. */
+  span: string;
+}
+
+export interface AmountMismatch {
+  stated: AmountAssertion;
+  charged: AmountAssertion;
+}
+
+const MONEY_RE = /\$\s*(\d[\d,]*(?:\.\d{1,2})?)/g;
+const STATED_CUE_RE =
+  /\b(receipt|invoice|bill|order|confirmation|checkout|quoted|stated|advertised|listed|price|total|subtotal)\b/gi;
+const CHARGED_CUE_RE =
+  /\b(charged|charge|deducted|debited|billed|card|bank|statement|posted)\b/gi;
+
+function moneyCents(raw: string): number {
+  return Math.round(Number(raw.replace(/,/g, "")) * 100);
+}
+
+export function formatMoney(cents: number): string {
+  return cents % 100 === 0 ? `$${cents / 100}` : `$${(cents / 100).toFixed(2)}`;
+}
+
+function lastCueIndex(re: RegExp, text: string): number {
+  re.lastIndex = 0;
+  let last = -1;
+  for (const m of text.matchAll(re)) last = m.index ?? last;
+  return last;
+}
+
+function firstCueIndex(re: RegExp, text: string): number {
+  re.lastIndex = 0;
+  const m = re.exec(text);
+  return m ? m.index : -1;
+}
+
+/** Classify one "$" mention by the nearest stated/charged cue around it. */
+function classifyAmount(sentence: string, moneyIndex: number, moneyLength: number): "stated" | "charged" | null {
+  const before = sentence.slice(Math.max(0, moneyIndex - 100), moneyIndex);
+  const after = sentence.slice(moneyIndex + moneyLength, moneyIndex + moneyLength + 60);
+  const beforeStated = lastCueIndex(STATED_CUE_RE, before);
+  const beforeCharged = lastCueIndex(CHARGED_CUE_RE, before);
+  if (beforeStated !== -1 || beforeCharged !== -1) {
+    return beforeCharged > beforeStated ? "charged" : "stated";
+  }
+  const afterStated = firstCueIndex(STATED_CUE_RE, after);
+  const afterCharged = firstCueIndex(CHARGED_CUE_RE, after);
+  if (afterStated === -1 && afterCharged === -1) return null;
+  if (afterStated === -1) return "charged";
+  if (afterCharged === -1) return "stated";
+  return afterCharged < afterStated ? "charged" : "stated";
+}
+
+export function detectAmountMismatch(text: string): AmountMismatch | null {
+  let stated: AmountAssertion | undefined;
+  let charged: AmountAssertion | undefined;
+  for (const sentence of splitSentences(text)) {
+    MONEY_RE.lastIndex = 0;
+    for (const m of sentence.matchAll(MONEY_RE)) {
+      const role = classifyAmount(sentence, m.index ?? 0, m[0].length);
+      if (role === "stated" && !stated) {
+        stated = { cents: moneyCents(m[1]), span: sentence };
+      } else if (role === "charged" && !charged) {
+        charged = { cents: moneyCents(m[1]), span: sentence };
+      }
+      if (stated && charged) break;
+    }
+    if (stated && charged) break;
+  }
+  if (!stated || !charged || stated.cents === charged.cents) return null;
+  // Temporal disqualification, same rule as the pair table: explicitly
+  // different time references make these two different charges, not one
+  // mismatched charge.
+  const ta = temporalMarker(stated.span);
+  const tb = temporalMarker(charged.span);
+  if (ta !== null && tb !== null && ta !== tb) return null;
+  return { stated, charged };
+}
 
 const RETRACTION_RE = /actually,?\s*wait|sorry,?\s*i\s+meant|i\s+was\s+wrong|scratch\s+that|\bcorrection:/i;
 
@@ -95,6 +189,7 @@ const TEMPORAL_RE =
 const LOAD_BEARING: Record<string, string[]> = {
   receipt: ["billing_dispute"],
   charge_count: ["billing_dispute"],
+  amount: ["billing_dispute"],
 };
 
 function splitSentences(text: string): string[] {
@@ -133,7 +228,11 @@ export function detectContradictions(
 
   for (const pair of CONTRADICTION_PAIRS) {
     const spanA = sentences.find((s) => spanMatches(s, pair.a, pair.aPhrases));
-    const spanB = sentences.find((s) => s !== spanA && spanMatches(s, pair.b, pair.bPhrases));
+    // TL-014: the competing assertion may live in the SAME sentence
+    // ("I was charged twice and charged only once") — real customers
+    // write run-ons, and the old `s !== spanA` requirement made those
+    // invisible while the two-sentence control surfaced.
+    const spanB = sentences.find((s) => spanMatches(s, pair.b, pair.bPhrases));
     if (!spanA || !spanB) continue;
     // Temporal disqualification: when BOTH spans carry explicit time references
     // and they DIFFER ("never received it Tuesday" vs "received it Thursday"),
@@ -167,5 +266,33 @@ export function detectContradictions(
         ` [severity: ${severity}; both statements preserved verbatim for entitlement/human review]`,
     );
   }
+  // TL-014 amount facet: stated-vs-charged amounts that disagree are a
+  // contradiction on the amount facet even when no pair-table assertion
+  // fires — and even when a P1 rule wins triage (notes-only surfacing is
+  // independent of the winner, so the money problem stays visible).
+  const mismatch = detectAmountMismatch(text);
+  if (mismatch) {
+    const description =
+      `amount mismatch on facet "amount" (amount_stated_vs_charged): ` +
+      `stated ${formatMoney(mismatch.stated.cents)} vs charged ${formatMoney(mismatch.charged.cents)}`;
+    const finding: ContradictionNote = {
+      pairId: "amount_stated_vs_charged",
+      facet: "amount",
+      statements: [mismatch.stated.span, mismatch.charged.span],
+      retractionMarker: retraction ? retraction[0] : null,
+      severity: (LOAD_BEARING.amount ?? []).includes(opts.category ?? "") ? "warn" : "info",
+      description,
+    };
+    findings.push(finding);
+    ruleHits.push("contradiction_amount_stated_vs_charged");
+    notes.push(
+      `contradiction[amount]: ${description} — "${mismatch.stated.span}" vs "${mismatch.charged.span}"` +
+        (finding.retractionMarker
+          ? ` (retraction marker noted: "${finding.retractionMarker}" — recorded, not resolved)`
+          : "") +
+        ` [severity: ${finding.severity}; both statements preserved verbatim for entitlement/human review]`,
+    );
+  }
+
   return { notes, ruleHits, findings };
 }

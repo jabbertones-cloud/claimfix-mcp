@@ -92,9 +92,11 @@ export interface PhraseHit {
   pattern: string;
   score: number;
   threshold: number;
+  /** TL-016: set when the hit needed bounded character-level typo tolerance. */
+  typoTolerant?: boolean;
 }
 
-const NEGATION_TOKENS = new Set([
+export const NEGATION_TOKENS = new Set([
   "not",
   "never",
   "no",
@@ -116,9 +118,40 @@ const NEGATION_TOKENS = new Set([
   "havent",
   "couldnt",
   "shouldnt",
+  // Spanish guard tokens used by the TL-015 localized P1 phrase sets.
+  "nunca",
+  "jamas",
+  "tampoco",
+  "ni",
+  "sin",
 ]);
 
-const NEGATION_WINDOW = 3;
+export const NEGATION_WINDOW = 3;
+
+/**
+ * TL-038: "going to" (and "gonna") is a periphrastic-future filler that
+ * pushes a negation token outside NEGATION_WINDOW: "not going to take
+ * legal action" puts "not" 4 tokens before the anchor, so the guard missed
+ * it and a polite disavowal escalated to P1/escalate_legal. Merge the
+ * bigram into one token for guard purposes only (tokenize() itself is
+ * untouched — fuzzy matching still sees the original tokens). "not going
+ * to hesitate to take legal action" still fires: "hesitate" stays between
+ * the negation and the anchor, and the double negation reads as assertion.
+ */
+export function mergeGoingTo(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === "going" && tokens[i + 1] === "to") {
+      out.push("going_to");
+      i++;
+    } else if (tokens[i] === "gonna") {
+      out.push("going_to");
+    } else {
+      out.push(tokens[i]);
+    }
+  }
+  return out;
+}
 
 /**
  * True when a negation token appears within NEGATION_WINDOW tokens BEFORE the
@@ -132,20 +165,172 @@ export function negatedBeforePhrase(text: string, phrase: string): boolean {
 }
 
 /** True when a negation token appears within NEGATION_WINDOW tokens BEFORE
- * the earliest matched phrase token ("I was not charged twice"). */
+ * the earliest matched phrase token ("I was not charged twice"). TL-038:
+ * the token stream is going_to-merged first so "not going to take X"
+ * still scopes the negation. */
 function negatedBefore(textTokens: string[], phraseTokenSet: Set<string>): boolean {
+  const toks = mergeGoingTo(textTokens);
   let earliest = -1;
-  for (let i = 0; i < textTokens.length; i++) {
-    if (phraseTokenSet.has(textTokens[i])) {
+  for (let i = 0; i < toks.length; i++) {
+    if (phraseTokenSet.has(toks[i])) {
       earliest = i;
       break;
     }
   }
   if (earliest === -1) return false;
   for (let i = Math.max(0, earliest - NEGATION_WINDOW); i < earliest; i++) {
-    if (NEGATION_TOKENS.has(textTokens[i])) return true;
+    if (NEGATION_TOKENS.has(toks[i])) return true;
   }
   return false;
+}
+
+/**
+ * TL-016: bounded character-level typo tolerance for multi-token phrases.
+ *
+ * token_set_ratio tolerates extra/intervening words but requires every
+ * token to be character-exact, so one typo ("charged twise", "chrged
+ * twise") silently defeated billing. The fallback below accepts a phrase
+ * only when EVERY phrase token is present either exactly or within edit
+ * distance 1 (tokens of length >= 4), with each text token consumed at
+ * most once. It is deliberately narrow:
+ * - multi-token phrases only (single-token "refund" stays exact);
+ * - one-edit maximum per token, no prefix/suffix stemming;
+ * - known confusable real words are excluded ("change"/"changed" are not
+ *   misspellings of "charge"/"charged").
+ * Number aliases need their surface forms back: normalize() rewrites
+ * "twice" to the token "2x", so the alias's originals are candidates too.
+ */
+const TYPO_TOKEN_ALIASES: Record<string, string[]> = {
+  "2x": ["2x", "twice", "double", "x2"],
+  "1x": ["1x", "once", "one"],
+};
+
+const TYPO_CONFUSABLES: Record<string, ReadonlySet<string>> = {
+  charged: new Set(["changed", "change"]),
+  charge: new Set(["change", "changed"]),
+};
+
+function editDistanceAtMostOne(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  if (a.length === b.length) {
+    let mismatches = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i] && ++mismatches > 1) return false;
+    }
+    return true;
+  }
+  const short = a.length < b.length ? a : b;
+  const long = a.length < b.length ? b : a;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < short.length && j < long.length) {
+    if (short[i] === long[j]) {
+      i++;
+      j++;
+    } else {
+      if (++edits > 1) return false;
+      j++; // one insertion/deletion in the longer token
+    }
+  }
+  return edits + (long.length - j) <= 1;
+}
+
+function typoTokenMatches(phraseToken: string, textToken: string): boolean {
+  if (TYPO_CONFUSABLES[phraseToken]?.has(textToken)) return false;
+  const candidates = TYPO_TOKEN_ALIASES[phraseToken] ?? [phraseToken];
+  return candidates.some(
+    (candidate) =>
+      Math.min(candidate.length, textToken.length) >= 4 &&
+      editDistanceAtMostOne(candidate, textToken),
+  );
+}
+
+/**
+ * Indices of the text tokens consumed by a typo-tolerant phrase match, or
+ * null when any phrase token has neither an exact nor a one-edit match.
+ * Exact matches are preferred so a correctly spelled token is never
+ * "spent" on a neighbouring typo candidate.
+ */
+function typoMatchedIndices(textTokens: string[], phraseTokens: string[]): number[] | null {
+  const used = new Set<number>();
+  const indices: number[] = [];
+  for (const phraseToken of phraseTokens) {
+    let idx = textTokens.findIndex((t, i) => !used.has(i) && t === phraseToken);
+    if (idx === -1) {
+      idx = textTokens.findIndex(
+        (t, i) => !used.has(i) && typoTokenMatches(phraseToken, t),
+      );
+    }
+    if (idx === -1) return null;
+    used.add(idx);
+    indices.push(idx);
+  }
+  return indices;
+}
+
+function negatedBeforeIndex(textTokens: string[], index: number): boolean {
+  // TL-038: index refers to the ORIGINAL token stream; map it through the
+  // going_to merge so "not going to take X" scopes the same as elsewhere.
+  const toks = mergeGoingTo(textTokens);
+  let mergedIdx = 0;
+  for (let i = 0; i < index && i < textTokens.length; i++) {
+    mergedIdx++;
+    if (textTokens[i] === "going" && textTokens[i + 1] === "to") i++;
+  }
+  for (let i = Math.max(0, mergedIdx - NEGATION_WINDOW); i < mergedIdx; i++) {
+    if (NEGATION_TOKENS.has(toks[i])) return true;
+  }
+  return false;
+}
+
+/**
+ * TL-038 (ledger): a fuzzy hit is only valid when EVERY phrase token has
+ * at least one occurrence that is not negated. token_set_ratio assembles a
+ * phrase from the whole field, so "a second charge. I was not charged
+ * twice" used to score "double charge" at 100 — the negated "twice"
+ * donated its 2x token while the unnegated "a second charge" donated
+ * "charge", and the old earliest-token guard only inspected the window
+ * before "charge". A token that occurs solely inside a negation can no
+ * longer contribute to a hit; a token with both negated and asserted
+ * occurrences still fires through its asserted occurrence. This subsumes
+ * the old earliest-token check for multi-token phrases. The token stream
+ * is going_to-merged first, matching negatedBefore's scoping.
+ */
+function everyPhraseTokenHasUnnegatedOccurrence(
+  textTokens: string[],
+  phraseTokens: string[],
+): boolean {
+  const toks = mergeGoingTo(textTokens);
+  const wanted = new Set(mergeGoingTo(phraseTokens));
+  const occurrences = new Map<string, number[]>();
+  for (let i = 0; i < toks.length; i++) {
+    if (wanted.has(toks[i])) {
+      const arr = occurrences.get(toks[i]) ?? [];
+      arr.push(i);
+      occurrences.set(toks[i], arr);
+    }
+  }
+  for (const token of wanted) {
+    const idxs = occurrences.get(token) ?? [];
+    let anyClean = false;
+    for (const idx of idxs) {
+      let negated = false;
+      for (let i = Math.max(0, idx - NEGATION_WINDOW); i < idx; i++) {
+        if (NEGATION_TOKENS.has(toks[i])) {
+          negated = true;
+          break;
+        }
+      }
+      if (!negated) {
+        anyClean = true;
+        break;
+      }
+    }
+    if (!anyClean) return false;
+  }
+  return true;
 }
 
 /**
@@ -161,13 +346,27 @@ export function matchPhrases(text: string, patterns: PhrasePattern[]): PhraseHit
   const tokens = tokenize(text);
   const hits: PhraseHit[] = [];
   for (const { phrase, threshold } of patterns) {
-    const score = tokenSetRatio(phrase, text);
-    if (score < threshold) continue;
     const phraseTokens = tokenize(phrase);
-    if (phraseTokens.length > 1 && negatedBefore(tokens, new Set(phraseTokens))) {
+    const score = tokenSetRatio(phrase, text);
+    if (score >= threshold) {
+      // TL-038 (ledger): per-token unnegated-occurrence check (subsumes the
+      // old earliest-token guard) — a token occurring solely inside a
+      // negation cannot donate to a fuzzy hit.
+      if (
+        phraseTokens.length > 1 &&
+        !everyPhraseTokenHasUnnegatedOccurrence(tokens, phraseTokens)
+      ) {
+        continue;
+      }
+      hits.push({ pattern: phrase, score: Math.round(score), threshold });
       continue;
     }
-    hits.push({ pattern: phrase, score: Math.round(score), threshold });
+    // TL-016 fallback: every phrase token present within one edit.
+    if (phraseTokens.length <= 1) continue;
+    const indices = typoMatchedIndices(tokens, phraseTokens);
+    if (!indices) continue;
+    if (negatedBeforeIndex(tokens, Math.min(...indices))) continue;
+    hits.push({ pattern: phrase, score: 99, threshold, typoTolerant: true });
   }
   hits.sort((a, b) => b.score - a.score);
   return hits;
@@ -180,5 +379,7 @@ export const BILLING_PHRASES: PhrasePattern[] = [
   { phrase: "wrong amount", threshold: 85 },
   { phrase: "did not authorize", threshold: 85 },
   { phrase: "unauthorized charge", threshold: 85 },
+  { phrase: "amount mismatch", threshold: 85 },
+  { phrase: "charged different amount", threshold: 85 },
   { phrase: "refund", threshold: 100 },
 ];
